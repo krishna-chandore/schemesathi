@@ -38,6 +38,10 @@ dependencies:
   clerk_flutter: ^0.0.18-beta
   clerk_auth: ^0.0.18-beta
   flutter_dotenv: ^6.0.1
+  http: ^1.6.0
+  app_links: ^7.2.2
+  shared_preferences: ^2.5.6
+  url_launcher: ^6.3.3
 
 dev_dependencies:
   flutter_test:

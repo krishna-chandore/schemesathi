@@ -1,13 +1,21 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:clerk_auth/clerk_auth.dart' as clerk;
 import 'package:clerk_flutter/clerk_flutter.dart';
+// The public config requires this unexported cache interface.
+// ignore: implementation_imports
+import 'package:clerk_flutter/src/utils/clerk_file_cache.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
+import '../citizen_form/form_service.dart';
+import '../citizen_form/form.dart';
 
 // ============================================================================
 // SchemeSathi - single-file auth module (Clerk, Google-only sign-in).
@@ -206,6 +214,58 @@ class AppTheme {
 // ---------------------------------------------------------------------------
 // clerk_auth_service
 // ---------------------------------------------------------------------------
+class _PrefsClerkPersistor implements clerk.Persistor {
+  SharedPreferences? _prefs;
+
+  @override
+  Future<void> initialize() async {
+    _prefs = await SharedPreferences.getInstance();
+  }
+
+  @override
+  void terminate() {}
+
+  @override
+  Future<T?> read<T>(String key) async {
+    _prefs ??= await SharedPreferences.getInstance();
+    final raw = _prefs?.getString(key);
+    if (raw == null) return null;
+    if (T == String) return raw as T;
+    try {
+      return jsonDecode(raw) as T;
+    } catch (_) {
+      return raw as T?;
+    }
+  }
+
+  @override
+  Future<void> write<T>(String key, T value) async {
+    _prefs ??= await SharedPreferences.getInstance();
+    await _prefs?.setString(key, value is String ? value : jsonEncode(value));
+  }
+
+  @override
+  Future<void> delete(String key) async {
+    _prefs ??= await SharedPreferences.getInstance();
+    await _prefs?.remove(key);
+  }
+}
+
+class _NoopClerkFileCache implements ClerkFileCache {
+  @override
+  Future<void> initialize() async {}
+
+  @override
+  void terminate() {}
+
+  @override
+  Stream<File> stream(
+    Uri uri, {
+    Duration ttl = ClerkFileCache.defaultTTL,
+    Map<String, String>? headers,
+  }) => const Stream.empty();
+}
+
 /// Google-only authentication on top of Clerk.
 ///
 /// The publishable key is read (in this order) from:
@@ -217,20 +277,23 @@ class ClerkAuthService extends ChangeNotifier {
 
   static final ClerkAuthService instance = ClerkAuthService._();
 
-  static const String _definedKey =
-      String.fromEnvironment('CLERK_PUBLISHABLE_KEY');
+  static const String _definedKey = String.fromEnvironment(
+    'CLERK_PUBLISHABLE_KEY',
+  );
 
   bool _isInitialized = false;
   bool _isLoading = false;
   bool _isSignedIn = false;
   String _publishableKey = '';
   String _userName = 'Citizen';
+  String? _userEmail;
   String? _errorMessage;
 
   bool get isInitialized => _isInitialized;
   bool get isLoading => _isLoading;
   bool get isSignedIn => _isSignedIn;
   String get userName => _userName;
+  String? get userEmail => _userEmail;
   String? get errorMessage => _errorMessage;
   String get publishableKey => _publishableKey;
 
@@ -241,8 +304,9 @@ class ClerkAuthService extends ChangeNotifier {
     final match = RegExp(r'^pk_(test|live)_(.+)$').firstMatch(_publishableKey);
     if (match == null) return false;
     try {
-      final decoded =
-          utf8.decode(base64.decode(base64.normalize(match.group(2)!)));
+      final decoded = utf8.decode(
+        base64.decode(base64.normalize(match.group(2)!)),
+      );
       return decoded.endsWith(r'$') && decoded.contains('.');
     } catch (_) {
       return false;
@@ -276,13 +340,21 @@ class ClerkAuthService extends ChangeNotifier {
   }
 
   /// Only call when [hasValidPublishableKey] is true.
+
   ClerkAuthConfig createAuthConfig() {
     return ClerkAuthConfig(
       publishableKey: _publishableKey,
-      // path_provider (Clerk's default session storage) has no web implementation,
-      // so on web we skip file persistence. Mobile keeps the default persistor.
-      persistor: kIsWeb ? clerk.Persistor.none : null,
-      // On web Clerk must redirect the browser back to this page.
+
+      // Enable persistent session storage on web so OAuth redirect doesn't lose state.
+      persistor: kIsWeb ? _PrefsClerkPersistor() : null,
+
+      // In web, stay in the same tab instead of launching a new window/tab.
+      defaultLaunchMode: LaunchMode.platformDefault,
+
+      // Avoid the default path_provider-based file cache on web.
+      fileCache: kIsWeb ? _NoopClerkFileCache() : null,
+
+      // Return to the current page after web OAuth.
       redirectionGenerator: kIsWeb
           ? (BuildContext context, clerk.Strategy strategy) => Uri.base
           : null,
@@ -290,15 +362,55 @@ class ClerkAuthService extends ChangeNotifier {
   }
 
   /// Reads the current Clerk session (e.g. after returning from Google on web).
-  void syncUser(BuildContext context) {
+  /// On web after OAuth redirect, Clerk needs time to hydrate session — retry with delays.
+  Future<void> syncUser(BuildContext context) async {
     if (!hasValidPublishableKey) return;
+
+    // Capture authState before any awaits to avoid BuildContext-across-async-gap warning
+    ClerkAuthState? authState;
     try {
-      final user = ClerkAuth.of(context, listen: false).user;
-      _applyUser(user);
-      notifyListeners();
+      authState = ClerkAuth.of(context, listen: false);
     } catch (e) {
-      debugPrint('[ClerkAuthService] syncUser skipped: $e');
+      debugPrint('[ClerkAuthService] syncUser: could not get authState: $e');
+      return;
     }
+
+    if (kIsWeb && Uri.base.queryParameters.isNotEmpty) {
+      try {
+        debugPrint('[ClerkAuthService] Parsing web OAuth redirect URI: ${Uri.base}');
+        await authState.parseDeepLink(Uri.base);
+      } catch (e) {
+        debugPrint('[ClerkAuthService] parseDeepLink error: $e');
+      }
+    }
+
+    const maxRetries = kIsWeb ? 4 : 1;
+
+    for (int attempt = 0; attempt < maxRetries; attempt++) {
+      if (attempt > 0) {
+        await Future.delayed(Duration(milliseconds: 350 * attempt));
+      }
+
+      try {
+        try {
+          await authState.refreshClient();
+        } catch (_) {}
+
+        _applyClerkState(authState);
+
+        // If signed in, success — break out and notify
+        if (_isSignedIn) {
+          debugPrint('[ClerkAuthService] syncUser signed in on attempt ${attempt + 1}: $_userEmail');
+          notifyListeners();
+          return;
+        }
+      } catch (e) {
+        debugPrint('[ClerkAuthService] syncUser attempt ${attempt + 1} error: $e');
+      }
+    }
+
+    debugPrint('[ClerkAuthService] syncUser exhausted retries, email still null');
+    notifyListeners();
   }
 
   Future<bool> signInWithGoogle(BuildContext context) async {
@@ -306,8 +418,7 @@ class ClerkAuthService extends ChangeNotifier {
     _errorMessage = null;
 
     if (!hasValidPublishableKey) {
-      _errorMessage =
-          'Clerk is not configured. Add a valid CLERK_PUBLISHABLE_KEY (see .env.example).';
+      _errorMessage = 'Clerk is not configured. Add a valid CLERK_PUBLISHABLE_KEY (see .env.example).';
       notifyListeners();
       return false;
     }
@@ -315,17 +426,37 @@ class ClerkAuthService extends ChangeNotifier {
     _setLoading(true);
     try {
       final authState = ClerkAuth.of(context, listen: false);
+
       await authState.ssoSignIn(
         context,
         clerk.Strategy.oauthGoogle,
         onError: (clerk.ClerkError error) {
-          debugPrint('[ClerkAuthService] SSO error: ${error.message}');
+          debugPrint('[ClerkAuthService] SSO error: ${error.message} (${error.code})');
           _errorMessage = error.message;
         },
       );
 
-      _applyUser(authState.user);
+      // Refresh clerk client and hydrate user email with retries
+      for (int i = 0; i < 4; i++) {
+        if (i > 0) {
+          await Future.delayed(Duration(milliseconds: 300 * i));
+        }
+        try {
+          await authState.refreshClient();
+        } catch (re) {
+          debugPrint('[ClerkAuthService] refreshClient error: $re');
+        }
+        _applyClerkState(authState);
+        if (_userEmail != null && _userEmail!.isNotEmpty) {
+          break;
+        }
+      }
+
+      debugPrint(
+        '[ClerkAuthService] Sign-in complete. Email: $_userEmail, Name: $_userName, SignedIn: $_isSignedIn',
+      );
       _setLoading(false);
+      notifyListeners();
       return _isSignedIn;
     } catch (e) {
       debugPrint('[ClerkAuthService] Google sign-in failed: $e');
@@ -346,14 +477,99 @@ class ClerkAuthService extends ChangeNotifier {
     } finally {
       _isSignedIn = false;
       _userName = 'Citizen';
+      _userEmail = null;
       _setLoading(false);
+    }
+  }
+
+  void _applyClerkState(ClerkAuthState authState) {
+    // Try multiple paths to get user object
+    var user = authState.user;
+
+    if (user == null) {
+      try {
+        user = authState.client.activeSession?.user;
+      } catch (_) {}
+    }
+
+    if (user == null) {
+      try {
+        final sessions = authState.client.sessions;
+        if (sessions.isNotEmpty) {
+          user = sessions.first.user;
+        }
+      } catch (_) {}
+    }
+
+    _applyUser(user);
+
+    // If activeSession exists, user IS signed in
+    if (authState.client.activeSession != null ||
+        authState.client.sessions.isNotEmpty) {
+      _isSignedIn = true;
+    }
+
+    // Fallback 1: session identifier (often the email)
+    if (_userEmail == null || _userEmail!.isEmpty) {
+      try {
+        final pubData = authState.client.activeSession?.publicUserData;
+        final id = pubData?.identifier;
+        if (id != null && id.contains('@')) {
+          _userEmail = id.trim();
+          _isSignedIn = true;
+          debugPrint('[ClerkAuthService] Email from session identifier: $_userEmail');
+        }
+        final pubFirst = pubData?.firstName;
+        if (pubFirst != null && pubFirst.isNotEmpty) {
+          _userName = pubFirst;
+        }
+      } catch (_) {}
+    }
+
+    // Fallback 2: email from first session's user emailAddresses
+    if (_userEmail == null || _userEmail!.isEmpty) {
+      try {
+        final sessions = authState.client.sessions;
+        if (sessions.isNotEmpty) {
+          final u = sessions.first.user;
+          if (u.emailAddresses != null && u.emailAddresses!.isNotEmpty) {
+            final e = u.emailAddresses!.first.emailAddress;
+            if (e.isNotEmpty) {
+              _userEmail = e;
+              _isSignedIn = true;
+              debugPrint('[ClerkAuthService] Email from first session emailAddresses: $_userEmail');
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
+    if (_userEmail != null && _userEmail!.isNotEmpty) {
+      _isSignedIn = true;
     }
   }
 
   void _applyUser(clerk.User? user) {
     _isSignedIn = user != null;
-    final name = user?.firstName;
-    _userName = (name != null && name.trim().isNotEmpty) ? name : 'Citizen';
+    if (user != null) {
+      final name = user.firstName ?? user.username;
+      if (name != null && name.trim().isNotEmpty) {
+        _userName = name.trim();
+      }
+      String? email = user.email;
+      if (email == null || email.isEmpty) {
+        final emails = user.emailAddresses;
+        if (emails != null && emails.isNotEmpty) {
+          email = emails.first.emailAddress;
+        }
+      }
+      if (email != null && email.isNotEmpty) {
+        _userEmail = email;
+      }
+    } else {
+      _userName = 'Citizen';
+      _userEmail = null;
+    }
   }
 
   void _setLoading(bool value) {
@@ -377,9 +593,7 @@ class GoogleLogo extends StatelessWidget {
     return SizedBox(
       width: size,
       height: size,
-      child: CustomPaint(
-        painter: _GoogleLogoPainter(),
-      ),
+      child: CustomPaint(painter: _GoogleLogoPainter()),
     );
   }
 }
@@ -475,87 +689,90 @@ class AppHeader extends StatelessWidget {
               Container(
                 width: 40,
                 height: 40,
-              decoration: BoxDecoration(
-                gradient: const LinearGradient(
-                  begin: Alignment.bottomLeft,
-                  end: Alignment.topRight,
-                  colors: [AppColors.primary, AppColors.primaryContainer],
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
+                    begin: Alignment.bottomLeft,
+                    end: Alignment.topRight,
+                    colors: [AppColors.primary, AppColors.primaryContainer],
+                  ),
+                  borderRadius: BorderRadius.circular(12),
+                  boxShadow: [
+                    BoxShadow(
+                      color: AppColors.primary.withValues(alpha: 0.25),
+                      blurRadius: 10,
+                      offset: const Offset(0, 4),
+                    ),
+                  ],
                 ),
-                borderRadius: BorderRadius.circular(12),
-                boxShadow: [
-                  BoxShadow(
-                    color: AppColors.primary.withValues(alpha: 0.25),
-                    blurRadius: 10,
-                    offset: const Offset(0, 4),
-                  ),
-                ],
+                child: const Icon(
+                  Icons.shield_rounded,
+                  color: Colors.white,
+                  size: 22,
+                ),
               ),
-              child: const Icon(
-                Icons.shield_rounded,
-                color: Colors.white,
-                size: 22,
-              ),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Flexible(
-                        child: Text(
-                          'SchemeSathi',
-                          style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                                fontSize: 18,
-                                fontWeight: FontWeight.w700,
-                                letterSpacing: -0.3,
-                                color: AppColors.onSurface,
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Flexible(
+                          child: Text(
+                            'SchemeSathi',
+                            style: Theme.of(context).textTheme.headlineMedium
+                                ?.copyWith(
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.w700,
+                                  letterSpacing: -0.3,
+                                  color: AppColors.onSurface,
+                                ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Container(
+                          width: 8,
+                          height: 8,
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF10B981),
+                            shape: BoxShape.circle,
+                            boxShadow: [
+                              BoxShadow(
+                                color: const Color(0xFF10B981)
+                                    .withValues(alpha: 0.6),
+                                blurRadius: 4,
+                                spreadRadius: 1,
                               ),
-                          overflow: TextOverflow.ellipsis,
+                            ],
+                          ),
                         ),
+                      ],
+                    ),
+                    Text(
+                      'CIVIC AI PLATFORM',
+                      style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                        color: AppColors.secondary,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 1.1,
+                        fontSize: 10,
                       ),
-                      const SizedBox(width: 6),
-                      Container(
-                        width: 8,
-                        height: 8,
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF10B981),
-                          shape: BoxShape.circle,
-                          boxShadow: [
-                            BoxShadow(
-                              color: const Color(0xFF10B981).withValues(alpha: 0.6),
-                              blurRadius: 4,
-                              spreadRadius: 1,
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                  Text(
-                    'CIVIC AI PLATFORM',
-                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                          color: AppColors.secondary,
-                          fontWeight: FontWeight.w700,
-                          letterSpacing: 1.1,
-                          fontSize: 10,
-                        ),
-                  ),
-                ],
+                    ),
+                  ],
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
-      ),
 
         // Language Switcher Pill
         Material(
           color: Colors.transparent,
           child: InkWell(
-            onTap: onLanguageTap ??
+            onTap:
+                onLanguageTap ??
                 () {
                   ScaffoldMessenger.of(context).showSnackBar(
                     const SnackBar(
@@ -594,10 +811,10 @@ class AppHeader extends StatelessWidget {
                   Text(
                     'EN / हिंदी',
                     style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
-                          color: AppColors.onSurface,
-                        ),
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: AppColors.onSurface,
+                    ),
                   ),
                   const SizedBox(width: 3),
                   const Icon(
@@ -668,11 +885,7 @@ class FeatureCard extends StatelessWidget {
               color: iconBgColor,
               borderRadius: BorderRadius.circular(12),
             ),
-            child: Icon(
-              icon,
-              color: iconColor,
-              size: 22,
-            ),
+            child: Icon(icon, color: iconColor, size: 22),
           ),
           const SizedBox(width: 12),
           Expanded(
@@ -685,7 +898,8 @@ class FeatureCard extends StatelessWidget {
                     Expanded(
                       child: Text(
                         title,
-                        style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        style: Theme.of(context).textTheme.titleMedium
+                            ?.copyWith(
                               fontSize: 13.5,
                               fontWeight: FontWeight.w700,
                               color: AppColors.onSurface,
@@ -706,10 +920,10 @@ class FeatureCard extends StatelessWidget {
                       child: Text(
                         badgeText,
                         style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                              color: badgeTextColor,
-                              fontSize: 10.5,
-                              fontWeight: FontWeight.w700,
-                            ),
+                          color: badgeTextColor,
+                          fontSize: 10.5,
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
                     ),
                   ],
@@ -718,10 +932,10 @@ class FeatureCard extends StatelessWidget {
                 Text(
                   description,
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                        color: AppColors.onSurfaceVariant,
-                        fontSize: 11.5,
-                        height: 1.4,
-                      ),
+                    color: AppColors.onSurfaceVariant,
+                    fontSize: 11.5,
+                    height: 1.4,
+                  ),
                 ),
               ],
             ),
@@ -739,11 +953,7 @@ class HelpdeskCard extends StatelessWidget {
   final VoidCallback? onWhatsAppTap;
   final VoidCallback? onEmailTap;
 
-  const HelpdeskCard({
-    super.key,
-    this.onWhatsAppTap,
-    this.onEmailTap,
-  });
+  const HelpdeskCard({super.key, this.onWhatsAppTap, this.onEmailTap});
 
   @override
   Widget build(BuildContext context) {
@@ -762,24 +972,31 @@ class HelpdeskCard extends StatelessWidget {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Row(
-                children: [
-                  const Icon(
-                    Icons.support_agent_rounded,
-                    color: AppColors.primary,
-                    size: 20,
-                  ),
-                  const SizedBox(width: 8),
-                  Text(
-                    'SchemeSathi Citizen Helpdesk',
-                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
+              Expanded(
+                child: Row(
+                  children: [
+                    const Icon(
+                      Icons.support_agent_rounded,
+                      color: AppColors.primary,
+                      size: 20,
+                    ),
+                    const SizedBox(width: 8),
+                    Flexible(
+                      child: Text(
+                        'SchemeSathi Citizen Helpdesk',
+                        style: Theme.of(context).textTheme.titleSmall?.copyWith(
                           fontWeight: FontWeight.w700,
                           fontSize: 12.5,
                           color: AppColors.onSurface,
                         ),
-                  ),
-                ],
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
+                      ),
+                    ),
+                  ],
+                ),
               ),
+              const SizedBox(width: 8),
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                 decoration: BoxDecoration(
@@ -789,10 +1006,10 @@ class HelpdeskCard extends StatelessWidget {
                 child: Text(
                   'Online',
                   style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                        color: AppColors.emeraldOnlineText,
-                        fontSize: 10,
-                        fontWeight: FontWeight.w700,
-                      ),
+                    color: AppColors.emeraldOnlineText,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
               ),
             ],
@@ -800,10 +1017,8 @@ class HelpdeskCard extends StatelessWidget {
           const SizedBox(height: 8),
           Text(
             'Still unable to log in? Reach our dedicated support team via WhatsApp or Email.',
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: AppColors.onSurfaceVariant,
-                  fontSize: 11.5,
-                ),
+            style: Theme.of(context).textTheme.bodySmall
+                ?.copyWith(color: AppColors.onSurfaceVariant, fontSize: 11.5),
           ),
           const SizedBox(height: 12),
           Row(
@@ -812,11 +1027,14 @@ class HelpdeskCard extends StatelessWidget {
                 child: Material(
                   color: Colors.transparent,
                   child: InkWell(
-                    onTap: onWhatsAppTap ??
+                    onTap:
+                        onWhatsAppTap ??
                         () {
                           ScaffoldMessenger.of(context).showSnackBar(
                             const SnackBar(
-                              content: Text('Opening SchemeSathi WhatsApp Help...'),
+                              content: Text(
+                                'Opening SchemeSathi WhatsApp Help...',
+                              ),
                               duration: Duration(seconds: 2),
                               behavior: SnackBarBehavior.floating,
                             ),
@@ -829,7 +1047,9 @@ class HelpdeskCard extends StatelessWidget {
                         color: AppColors.surfaceContainerLowest,
                         borderRadius: BorderRadius.circular(12),
                         border: Border.all(
-                          color: AppColors.outlineVariant.withValues(alpha: 0.35),
+                          color: AppColors.outlineVariant.withValues(
+                            alpha: 0.35,
+                          ),
                         ),
                         boxShadow: [
                           BoxShadow(
@@ -867,11 +1087,14 @@ class HelpdeskCard extends StatelessWidget {
                 child: Material(
                   color: Colors.transparent,
                   child: InkWell(
-                    onTap: onEmailTap ??
+                    onTap:
+                        onEmailTap ??
                         () {
                           ScaffoldMessenger.of(context).showSnackBar(
                             const SnackBar(
-                              content: Text('Opening support@schemesathi.in...'),
+                              content: Text(
+                                'Opening support@schemesathi.in...',
+                              ),
                               duration: Duration(seconds: 2),
                               behavior: SnackBarBehavior.floating,
                             ),
@@ -884,7 +1107,9 @@ class HelpdeskCard extends StatelessWidget {
                         color: AppColors.surfaceContainerLowest,
                         borderRadius: BorderRadius.circular(12),
                         border: Border.all(
-                          color: AppColors.outlineVariant.withValues(alpha: 0.35),
+                          color: AppColors.outlineVariant.withValues(
+                            alpha: 0.35,
+                          ),
                         ),
                         boxShadow: [
                           BoxShadow(
@@ -942,9 +1167,7 @@ class ResponsiveScaffold extends StatelessWidget {
         height: size,
         decoration: BoxDecoration(
           shape: BoxShape.circle,
-          gradient: RadialGradient(
-            colors: [color, color.withValues(alpha: 0)],
-          ),
+          gradient: RadialGradient(colors: [color, color.withValues(alpha: 0)]),
         ),
       ),
     );
@@ -994,68 +1217,10 @@ class AuthHelpScreen extends StatefulWidget {
 
 class _AuthHelpScreenState extends State<AuthHelpScreen> {
   bool _isConnecting = false;
-  String _btnText = 'Continue with Google';
-  IconData _btnIcon = Icons.arrow_forward_rounded;
-  Color _btnBgColor = AppColors.primaryContainer;
+  final String _btnText = 'Continue with Google';
+  final IconData _btnIcon = Icons.arrow_forward_rounded;
+  final Color _btnBgColor = AppColors.primaryContainer;
 
-  void _handleGoogleHelpSignIn() async {
-    if (_isConnecting) return;
-
-    setState(() {
-      _isConnecting = true;
-      _btnText = 'Connecting with Clerk...';
-    });
-
-    final authService = ClerkAuthService.instance;
-    final success = await authService.signInWithGoogle(context);
-
-    if (!mounted) return;
-
-    if (success) {
-      setState(() {
-        _btnText = 'Redirecting...';
-        _btnIcon = Icons.check_circle_rounded;
-        _btnBgColor = AppColors.tertiaryContainer;
-      });
-
-      await Future.delayed(const Duration(milliseconds: 700));
-
-      if (!mounted) return;
-
-      Navigator.of(context).pop();
-
-      final userName = authService.userName;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Row(
-            children: [
-              const Icon(Icons.check_circle_rounded, color: Colors.white, size: 20),
-              const SizedBox(width: 8),
-              Text('Welcome, $userName! Authenticated via Clerk.'),
-            ],
-          ),
-          backgroundColor: AppColors.primaryContainer,
-          behavior: SnackBarBehavior.floating,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        ),
-      );
-    } else {
-      setState(() {
-        _isConnecting = false;
-        _btnText = 'Continue with Google';
-      });
-
-      if (authService.errorMessage != null) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(authService.errorMessage!),
-            backgroundColor: Colors.red.shade700,
-            behavior: SnackBarBehavior.floating,
-          ),
-        );
-      }
-    }
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -1082,7 +1247,9 @@ class _AuthHelpScreenState extends State<AuthHelpScreen> {
                         color: AppColors.surfaceContainerLowest,
                         shape: BoxShape.circle,
                         border: Border.all(
-                          color: AppColors.outlineVariant.withValues(alpha: 0.35),
+                          color: AppColors.outlineVariant.withValues(
+                            alpha: 0.35,
+                          ),
                         ),
                         boxShadow: [
                           BoxShadow(
@@ -1103,11 +1270,11 @@ class _AuthHelpScreenState extends State<AuthHelpScreen> {
                 Text(
                   'GOOGLE SIGN-IN HELP',
                   style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: 1.2,
-                        fontSize: 11,
-                        color: AppColors.onSurfaceVariant.withValues(alpha: 0.8),
-                      ),
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.2,
+                    fontSize: 11,
+                    color: AppColors.onSurfaceVariant.withValues(alpha: 0.8),
+                  ),
                 ),
                 const SizedBox(width: 40),
               ],
@@ -1144,7 +1311,9 @@ class _AuthHelpScreenState extends State<AuthHelpScreen> {
                           color: AppColors.surfaceContainerLowest,
                           borderRadius: BorderRadius.circular(14),
                           border: Border.all(
-                            color: AppColors.outlineVariant.withValues(alpha: 0.3),
+                            color: AppColors.outlineVariant.withValues(
+                              alpha: 0.3,
+                            ),
                           ),
                           boxShadow: [
                             BoxShadow(
@@ -1154,9 +1323,7 @@ class _AuthHelpScreenState extends State<AuthHelpScreen> {
                             ),
                           ],
                         ),
-                        child: const Center(
-                          child: GoogleLogo(size: 26),
-                        ),
+                        child: const Center(child: GoogleLogo(size: 26)),
                       ),
                     ),
                   ),
@@ -1233,10 +1400,10 @@ class _AuthHelpScreenState extends State<AuthHelpScreen> {
             Text(
               'No Password Needed',
               style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                    fontSize: 24,
-                    fontWeight: FontWeight.w800,
-                    color: AppColors.onSurface,
-                  ),
+                fontSize: 24,
+                fontWeight: FontWeight.w800,
+                color: AppColors.onSurface,
+              ),
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 8),
@@ -1246,15 +1413,12 @@ class _AuthHelpScreenState extends State<AuthHelpScreen> {
               textAlign: TextAlign.center,
               text: TextSpan(
                 style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      color: AppColors.onSurfaceVariant,
-                      fontSize: 13,
-                      height: 1.45,
-                    ),
+                  color: AppColors.onSurfaceVariant,
+                  fontSize: 13,
+                  height: 1.45,
+                ),
                 children: const [
-                  TextSpan(
-                    text:
-                        'SchemeSathi connects directly with your ',
-                  ),
+                  TextSpan(text: 'SchemeSathi connects directly with your '),
                   TextSpan(
                     text: 'Google Account',
                     style: TextStyle(
@@ -1311,7 +1475,8 @@ class _AuthHelpScreenState extends State<AuthHelpScreen> {
                         children: [
                           Text(
                             'QUICK SIGN-IN',
-                            style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                            style: Theme.of(context).textTheme.labelSmall
+                                ?.copyWith(
                                   fontWeight: FontWeight.w700,
                                   color: AppColors.onSurfaceVariant,
                                   fontSize: 10.5,
@@ -1320,7 +1485,8 @@ class _AuthHelpScreenState extends State<AuthHelpScreen> {
                           ),
                           Text(
                             'Return to SchemeSathi',
-                            style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                            style: Theme.of(context).textTheme.titleSmall
+                                ?.copyWith(
                                   fontWeight: FontWeight.w700,
                                   fontSize: 13.5,
                                   color: AppColors.onSurface,
@@ -1342,7 +1508,37 @@ class _AuthHelpScreenState extends State<AuthHelpScreen> {
                   Material(
                     color: Colors.transparent,
                     child: InkWell(
-                      onTap: _isConnecting ? null : _handleGoogleHelpSignIn,
+                      onTap: _isConnecting
+                          ? null
+                          : () async {
+                              setState(() => _isConnecting = true);
+                              try {
+                                final authService = ClerkAuthService.instance;
+                                final success = await authService.signInWithGoogle(context);
+                                if (!context.mounted) return;
+                                if (success || authService.isSignedIn) {
+                                  final email = authService.userEmail;
+                                  final name = authService.userName;
+                                  bool hasProfile = false;
+                                  if (email != null && email.isNotEmpty) {
+                                    hasProfile = await FormService.instance.checkProfile(email);
+                                  } else {
+                                    hasProfile = await FormService.instance.isProfileCompletedLocally();
+                                  }
+                                  if (!context.mounted) return;
+                                  if (hasProfile) {
+                                    Navigator.of(context).pushNamedAndRemoveUntil('/home', (_) => false, arguments: name);
+                                  } else {
+                                    Navigator.of(context).pushAndRemoveUntil(
+                                      MaterialPageRoute(builder: (_) => CitizenProfileSetupPage(initialEmail: email)),
+                                      (_) => false,
+                                    );
+                                  }
+                                }
+                              } finally {
+                                if (mounted) setState(() => _isConnecting = false);
+                              }
+                            },
                       borderRadius: BorderRadius.circular(14),
                       child: AnimatedContainer(
                         duration: const Duration(milliseconds: 300),
@@ -1368,9 +1564,7 @@ class _AuthHelpScreenState extends State<AuthHelpScreen> {
                                 color: Colors.white,
                                 shape: BoxShape.circle,
                               ),
-                              child: const Center(
-                                child: GoogleLogo(size: 15),
-                              ),
+                              child: const Center(child: GoogleLogo(size: 15)),
                             ),
                             const SizedBox(width: 10),
                             Text(
@@ -1382,21 +1576,20 @@ class _AuthHelpScreenState extends State<AuthHelpScreen> {
                               ),
                             ),
                             const SizedBox(width: 8),
-                            if (_isConnecting && _btnIcon == Icons.arrow_forward_rounded)
+                            if (_isConnecting &&
+                                _btnIcon == Icons.arrow_forward_rounded)
                               const SizedBox(
                                 width: 16,
                                 height: 16,
                                 child: CircularProgressIndicator(
                                   strokeWidth: 2,
-                                  valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                                  valueColor: AlwaysStoppedAnimation<Color>(
+                                    Colors.white,
+                                  ),
                                 ),
                               )
                             else
-                              Icon(
-                                _btnIcon,
-                                color: Colors.white,
-                                size: 18,
-                              ),
+                              Icon(_btnIcon, color: Colors.white, size: 18),
                           ],
                         ),
                       ),
@@ -1452,8 +1645,7 @@ class _AuthHelpScreenState extends State<AuthHelpScreen> {
                     icon: Icons.switch_account_rounded,
                     iconColor: AppColors.primary,
                     title: 'Switch or verify your Google Account',
-                    description:
-                        'Ensure you choose the specific Gmail/Workspace account linked with your SchemeSathi citizen profile.',
+                    description: 'Ensure you choose the specific Gmail/Workspace account linked with your SchemeSathi citizen profile.',
                   ),
                   const SizedBox(height: 10),
 
@@ -1462,8 +1654,7 @@ class _AuthHelpScreenState extends State<AuthHelpScreen> {
                     icon: Icons.security_rounded,
                     iconColor: AppColors.secondary,
                     title: 'Forgot your Google password?',
-                    description:
-                        "Use Google's official recovery flow to regain access to your Google identity.",
+                    description: "Use Google's official recovery flow to regain access to your Google identity.",
                     actionWidget: InkWell(
                       onTap: () {
                         ScaffoldMessenger.of(context).showSnackBar(
@@ -1506,8 +1697,7 @@ class _AuthHelpScreenState extends State<AuthHelpScreen> {
                     icon: Icons.cached_rounded,
                     iconColor: AppColors.onSurfaceVariant,
                     title: 'Popup blocked or stuck loading?',
-                    description:
-                        'Allow popups or clear your default mobile browser cookies to refresh authentication tokens.',
+                    description: 'Allow popups or clear your default mobile browser cookies to refresh authentication tokens.',
                   ),
                 ],
               ),
@@ -1530,10 +1720,10 @@ class _AuthHelpScreenState extends State<AuthHelpScreen> {
                 label: Text(
                   'Return to Sign In screen',
                   style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                        color: AppColors.onSurfaceVariant,
-                        fontWeight: FontWeight.w600,
-                        fontSize: 12,
-                      ),
+                    color: AppColors.onSurfaceVariant,
+                    fontWeight: FontWeight.w600,
+                    fontSize: 12,
+                  ),
                 ),
               ),
             ),
@@ -1584,11 +1774,7 @@ class _AuthHelpScreenState extends State<AuthHelpScreen> {
               color: AppColors.surfaceContainer,
               borderRadius: BorderRadius.circular(8),
             ),
-            child: Icon(
-              icon,
-              color: iconColor,
-              size: 18,
-            ),
+            child: Icon(icon, color: iconColor, size: 18),
           ),
           const SizedBox(width: 10),
           Expanded(
@@ -1634,40 +1820,86 @@ class AuthScreen extends StatefulWidget {
 
 class _AuthScreenState extends State<AuthScreen> {
   bool _isHindi = false;
+  bool _isRedirecting = false;
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) ClerkAuthService.instance.syncUser(context);
+    ClerkAuthService.instance.addListener(_onAuthStateChanged);
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (mounted) {
+        await ClerkAuthService.instance.syncUser(context);
+        if (mounted) {
+          _checkAndRedirect();
+        }
+      }
     });
   }
 
-  void _handleGoogleSignIn() async {
+  @override
+  void dispose() {
+    ClerkAuthService.instance.removeListener(_onAuthStateChanged);
+    super.dispose();
+  }
+
+  void _onAuthStateChanged() {
+    if (mounted) {
+      _checkAndRedirect();
+    }
+  }
+
+  void _checkAndRedirect() {
     final authService = ClerkAuthService.instance;
-    final success = await authService.signInWithGoogle(context);
+    if (authService.isSignedIn && !_isRedirecting && mounted) {
+      _isRedirecting = true;
+      _routeAfterLogin();
+    }
+  }
+
+  /// Checks if this user already has a profile.
+  /// Navigates to /home if yes, /form if no (first-time login only).
+  Future<void> _routeAfterLogin() async {
+    final authService = ClerkAuthService.instance;
+    final email = authService.userEmail;
+    final name = authService.userName;
+
+    bool hasProfile = false;
+    try {
+      if (email != null && email.isNotEmpty) {
+        hasProfile = await FormService.instance.checkProfile(email);
+      } else {
+        hasProfile = await FormService.instance.isProfileCompletedLocally();
+      }
+    } catch (e) {
+      debugPrint('[AuthScreen] Profile check error: $e');
+    }
 
     if (!mounted) return;
 
-    if (success) {
-      final userName = authService.userName;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Row(
-            children: [
-              const Icon(Icons.check_circle_rounded, color: Colors.white, size: 20),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text('Welcome, $userName! Authenticated with Clerk.'),
-              ),
-            ],
-          ),
-          backgroundColor: AppColors.primaryContainer,
-          behavior: SnackBarBehavior.floating,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-          duration: const Duration(seconds: 3),
-        ),
+    if (hasProfile) {
+      // Returning user: go straight to home dashboard
+      Navigator.of(context).pushNamedAndRemoveUntil(
+        '/home',
+        (_) => false,
+        arguments: name,
       );
+    } else {
+      // First-time user: show form setup
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(
+          builder: (_) => CitizenProfileSetupPage(initialEmail: email),
+        ),
+        (_) => false,
+      );
+    }
+  }
+
+  void _navigateToLogin() async {
+    final authService = ClerkAuthService.instance;
+    final success = await authService.signInWithGoogle(context);
+    if (!mounted) return;
+    if (success || authService.isSignedIn) {
+      _routeAfterLogin();
     } else if (authService.errorMessage != null) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -1679,24 +1911,19 @@ class _AuthScreenState extends State<AuthScreen> {
     }
   }
 
-  void _handleGuestExplore() {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: const Text('Exploring Public Schemes Catalog as Guest...'),
-        backgroundColor: AppColors.primary,
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        duration: const Duration(seconds: 2),
-      ),
-    );
+  void _handleGuestExplore() async {
+    final hasProfile = await FormService.instance.isProfileCompletedLocally();
+    if (!mounted) return;
+    if (hasProfile) {
+      Navigator.of(context).pushNamedAndRemoveUntil('/home', (_) => false);
+    } else {
+      Navigator.of(context).pushNamed('/form');
+    }
   }
 
   void _navigateToHelp() {
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (context) => const AuthHelpScreen(),
-      ),
-    );
+    Navigator.of(context)
+        .push(MaterialPageRoute(builder: (context) => const AuthHelpScreen()));
   }
 
   void _toggleLanguage() {
@@ -1705,7 +1932,9 @@ class _AuthScreenState extends State<AuthScreen> {
     });
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(_isHindi ? 'हिंदी सक्रिय (Hindi Active)' : 'English Active'),
+        content: Text(
+          _isHindi ? 'हिंदी सक्रिय (Hindi Active)' : 'English Active',
+        ),
         behavior: SnackBarBehavior.floating,
         duration: const Duration(seconds: 1),
       ),
@@ -1783,7 +2012,10 @@ class _AuthScreenState extends State<AuthScreen> {
                 constraints: const BoxConstraints(maxWidth: 480),
                 child: SingleChildScrollView(
                   physics: const BouncingScrollPhysics(),
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 12,
+                  ),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.center,
                     children: [
@@ -1878,6 +2110,7 @@ class _AuthScreenState extends State<AuthScreen> {
 
         // Right Controls: Language Selector Pill & Quick Sign In
         Row(
+          mainAxisSize: MainAxisSize.min,
           children: [
             // Language Pill
             Material(
@@ -1886,7 +2119,10 @@ class _AuthScreenState extends State<AuthScreen> {
                 onTap: _toggleLanguage,
                 borderRadius: BorderRadius.circular(999),
                 child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 5,
+                  ),
                   decoration: BoxDecoration(
                     color: Colors.white,
                     borderRadius: BorderRadius.circular(999),
@@ -1903,12 +2139,12 @@ class _AuthScreenState extends State<AuthScreen> {
                     children: [
                       const Icon(
                         Icons.translate_rounded,
-                        size: 16,
+                        size: 14,
                         color: Color(0xFF3525CD),
                       ),
-                      const SizedBox(width: 4),
+                      const SizedBox(width: 3),
                       Text(
-                        _isHindi ? 'हिंदी' : 'EN / हिंदी',
+                        _isHindi ? 'हि' : 'EN',
                         style: const TextStyle(
                           fontFamily: 'Plus Jakarta Sans',
                           fontSize: 11,
@@ -1916,24 +2152,18 @@ class _AuthScreenState extends State<AuthScreen> {
                           color: Color(0xFF131B2E),
                         ),
                       ),
-                      const SizedBox(width: 2),
-                      const Icon(
-                        Icons.expand_more_rounded,
-                        size: 14,
-                        color: Color(0xFF777587),
-                      ),
                     ],
                   ),
                 ),
               ),
             ),
-            const SizedBox(width: 6),
+            const SizedBox(width: 4),
 
             // Quick Sign In Link
             TextButton(
-              onPressed: _handleGoogleSignIn,
+              onPressed: _navigateToLogin,
               style: TextButton.styleFrom(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 5),
                 minimumSize: Size.zero,
                 tapTargetSize: MaterialTapTargetSize.shrinkWrap,
               ),
@@ -1941,7 +2171,7 @@ class _AuthScreenState extends State<AuthScreen> {
                 'Sign In',
                 style: TextStyle(
                   fontFamily: 'Plus Jakarta Sans',
-                  fontSize: 12,
+                  fontSize: 11,
                   fontWeight: FontWeight.w600,
                   color: Color(0xFF3525CD),
                 ),
@@ -2042,7 +2272,10 @@ class _AuthScreenState extends State<AuthScreen> {
                   child: Transform.rotate(
                     angle: -0.05,
                     child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
                       decoration: BoxDecoration(
                         color: Colors.white.withValues(alpha: 0.95),
                         borderRadius: BorderRadius.circular(12),
@@ -2110,7 +2343,10 @@ class _AuthScreenState extends State<AuthScreen> {
                   child: Transform.rotate(
                     angle: 0.08,
                     child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 9,
+                        vertical: 5,
+                      ),
                       decoration: BoxDecoration(
                         color: Colors.white.withValues(alpha: 0.95),
                         borderRadius: BorderRadius.circular(10),
@@ -2156,7 +2392,10 @@ class _AuthScreenState extends State<AuthScreen> {
                   child: Transform.rotate(
                     angle: -0.08,
                     child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 9,
+                        vertical: 5,
+                      ),
                       decoration: BoxDecoration(
                         color: Colors.white.withValues(alpha: 0.95),
                         borderRadius: BorderRadius.circular(10),
@@ -2199,7 +2438,10 @@ class _AuthScreenState extends State<AuthScreen> {
                   child: Transform.rotate(
                     angle: 0.04,
                     child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
                       decoration: BoxDecoration(
                         color: Colors.white.withValues(alpha: 0.95),
                         borderRadius: BorderRadius.circular(12),
@@ -2284,24 +2526,28 @@ class _AuthScreenState extends State<AuthScreen> {
                   ),
                 ),
                 const SizedBox(width: 6),
-                RichText(
-                  text: const TextSpan(
-                    style: TextStyle(
-                      fontFamily: 'Plus Jakarta Sans',
-                      fontSize: 12,
-                      fontWeight: FontWeight.w500,
-                      color: Color(0xFF131B2E),
-                    ),
-                    children: [
-                      TextSpan(
-                        text: '3,240+ ',
-                        style: TextStyle(
-                          fontWeight: FontWeight.w700,
-                          color: Color(0xFF3525CD),
-                        ),
+                Flexible(
+                  child: RichText(
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
+                    text: const TextSpan(
+                      style: TextStyle(
+                        fontFamily: 'Plus Jakarta Sans',
+                        fontSize: 12,
+                        fontWeight: FontWeight.w500,
+                        color: Color(0xFF131B2E),
                       ),
-                      TextSpan(text: 'Schemes Verified for FY 2025'),
-                    ],
+                      children: [
+                        TextSpan(
+                          text: '3,240+ ',
+                          style: TextStyle(
+                            fontWeight: FontWeight.w700,
+                            color: Color(0xFF3525CD),
+                          ),
+                        ),
+                        TextSpan(text: 'Schemes Verified for FY 2025'),
+                      ],
+                    ),
                   ),
                 ),
               ],
@@ -2325,10 +2571,7 @@ class _AuthScreenState extends State<AuthScreen> {
           child: const Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Text(
-                '🙏',
-                style: TextStyle(fontSize: 13),
-              ),
+              Text('🙏', style: TextStyle(fontSize: 13)),
               SizedBox(width: 5),
               Text(
                 'नमस्ते • A WARM WELCOME',
@@ -2392,7 +2635,7 @@ class _AuthScreenState extends State<AuthScreen> {
             return Material(
               color: Colors.transparent,
               child: InkWell(
-                onTap: isLoading ? null : _handleGoogleSignIn,
+                onTap: _navigateToLogin,
                 borderRadius: BorderRadius.circular(16),
                 child: Container(
                   width: double.infinity,
@@ -2409,56 +2652,64 @@ class _AuthScreenState extends State<AuthScreen> {
                     ],
                   ),
                   child: Center(
-                    child: isLoading
-                        ? const Row(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              SizedBox(
-                                width: 18,
-                                height: 18,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                  valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                                ),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      child: FittedBox(
+                        fit: BoxFit.scaleDown,
+                        child: isLoading
+                            ? const Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      valueColor: AlwaysStoppedAnimation<Color>(
+                                        Colors.white,
+                                      ),
+                                    ),
+                                  ),
+                                  SizedBox(width: 10),
+                                  Text(
+                                    'Connecting...',
+                                    style: TextStyle(
+                                      fontFamily: 'Plus Jakarta Sans',
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.w600,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                                ],
+                              )
+                            : const Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Icon(
+                                    Icons.fingerprint_rounded,
+                                    size: 20,
+                                    color: Colors.white,
+                                  ),
+                                  SizedBox(width: 8),
+                                  Text(
+                                    'Get Started / शुरू करें',
+                                    style: TextStyle(
+                                      fontFamily: 'Plus Jakarta Sans',
+                                      fontSize: 14.5,
+                                      fontWeight: FontWeight.w600,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                                  SizedBox(width: 8),
+                                  Icon(
+                                    Icons.arrow_forward_rounded,
+                                    size: 18,
+                                    color: Colors.white,
+                                  ),
+                                ],
                               ),
-                              SizedBox(width: 10),
-                              Text(
-                                'Connecting...',
-                                style: TextStyle(
-                                  fontFamily: 'Plus Jakarta Sans',
-                                  fontSize: 14,
-                                  fontWeight: FontWeight.w600,
-                                  color: Colors.white,
-                                ),
-                              ),
-                            ],
-                          )
-                        : const Row(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              Icon(
-                                Icons.fingerprint_rounded,
-                                size: 20,
-                                color: Colors.white,
-                              ),
-                              SizedBox(width: 8),
-                              Text(
-                                'Get Started / शुरू करें',
-                                style: TextStyle(
-                                  fontFamily: 'Plus Jakarta Sans',
-                                  fontSize: 14.5,
-                                  fontWeight: FontWeight.w600,
-                                  color: Colors.white,
-                                ),
-                              ),
-                              SizedBox(width: 8),
-                              Icon(
-                                Icons.arrow_forward_rounded,
-                                size: 18,
-                                color: Colors.white,
-                              ),
-                            ],
-                          ),
+                      ),
+                    ),
                   ),
                 ),
               ),
@@ -2480,25 +2731,31 @@ class _AuthScreenState extends State<AuthScreen> {
                 color: const Color(0xFFF2F3FF),
                 borderRadius: BorderRadius.circular(16),
               ),
-              child: const Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(
-                    Icons.explore_rounded,
-                    size: 17,
-                    color: Color(0xFF3525CD),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: const Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.explore_rounded,
+                        size: 17,
+                        color: Color(0xFF3525CD),
+                      ),
+                      SizedBox(width: 6),
+                      Text(
+                        'Explore 3,200+ Schemes as Guest',
+                        style: TextStyle(
+                          fontFamily: 'Plus Jakarta Sans',
+                          fontSize: 13.5,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xFF131B2E),
+                        ),
+                      ),
+                    ],
                   ),
-                  SizedBox(width: 6),
-                  Text(
-                    'Explore 3,200+ Schemes as Guest',
-                    style: TextStyle(
-                      fontFamily: 'Plus Jakarta Sans',
-                      fontSize: 13.5,
-                      fontWeight: FontWeight.w600,
-                      color: Color(0xFF131B2E),
-                    ),
-                  ),
-                ],
+                ),
               ),
             ),
           ),
@@ -2526,15 +2783,16 @@ class _AuthScreenState extends State<AuthScreen> {
         const SizedBox(height: 6),
 
         // Micro Civic Footer
-        const Row(
-          mainAxisAlignment: MainAxisAlignment.center,
+        const Wrap(
+          alignment: WrapAlignment.center,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          spacing: 4,
           children: [
             Icon(
               Icons.enhanced_encryption_rounded,
               size: 13,
               color: Color(0xFF777587),
             ),
-            SizedBox(width: 4),
             Text(
               'Digital India Compliant • 256-Bit Bank-Grade Encryption',
               style: TextStyle(
