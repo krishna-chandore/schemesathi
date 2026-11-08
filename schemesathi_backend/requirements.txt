@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pydantic[email]
+pymongo
+python-dotenv
+requests
+beautifulsoup4
+playwright
+redis
+httpx
+pyjwt[crypto]

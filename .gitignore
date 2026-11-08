@@ -1,0 +1,128 @@
+# =============================================================================
+# SchemeSathi — Root .gitignore
+# Covers: Flutter/Dart (schemesathi_app/) + Python/FastAPI (schemesathi_backend/)
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 🔐 Secrets & Environment Files — NEVER commit these
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.json
+google-services.json
+GoogleService-Info.plist
+**/firebase_options.dart
+
+# ---------------------------------------------------------------------------
+# Flutter / Dart (schemesathi_app/)
+# ---------------------------------------------------------------------------
+**/doc/api/
+**/ios/Flutter/.last_build_id
+**/.dart_tool/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.pub-cache/
+**/.pub/
+**/build/
+**/coverage/
+app.*.symbols
+app.*.map.json
+*.iml
+
+# Android build artifacts
+**/android/app/debug/
+**/android/app/profile/
+**/android/app/release/
+**/android/.gradle/
+**/android/captures/
+**/android/local.properties
+**/android/key.properties
+**/android/*.jks
+**/android/*.keystore
+
+# iOS / macOS build artifacts
+**/ios/Pods/
+**/ios/.symlinks/
+**/macos/Pods/
+**/macos/.symlinks/
+**/*.xcworkspace
+**/*.xcuserdata
+**/*.xccheckout
+**/.packages
+
+# Widget Preview
+**/.widget_preview/
+
+# ---------------------------------------------------------------------------
+# Python / FastAPI (schemesathi_backend/)
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env/
+
+# Scraper runtime caches & dumps
+.myscheme_dataset_cache.json
+*.json.bak
+scraped_schemes.json
+scraped_*.json
+scratch_*.py
+
+# ---------------------------------------------------------------------------
+# Logs & runtime
+# ---------------------------------------------------------------------------
+logs/
+*.log
+*.log.*
+npm-debug.log*
+yarn-debug.log*
+
+# ---------------------------------------------------------------------------
+# IDE / Editor
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+.history/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# ---------------------------------------------------------------------------
+# Operating System files
+# ---------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
