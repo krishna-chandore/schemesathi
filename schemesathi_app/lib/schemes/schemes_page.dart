@@ -175,6 +175,10 @@ class _SchemesContentViewState extends State<SchemesContentView> {
       _loadSchemesFromDb(
         state: _selectedState != 'All States' ? _selectedState : null,
         q: currentQuery.isNotEmpty ? currentQuery : null,
+        category: _selectedCategory != 'All' ? _selectedCategory : null,
+        level: (_selectedFilterIndex != 0 && !_filters[_selectedFilterIndex].contains('Eligible'))
+            ? _filters[_selectedFilterIndex]
+            : null,
       );
     });
   }
@@ -195,33 +199,95 @@ class _SchemesContentViewState extends State<SchemesContentView> {
     } catch (_) {}
   }
 
-  Future<void> _loadSchemesFromDb({String? state, String? q}) async {
-    setState(() => _isLoading = true);
+  int _activeSearchRequestId = 0;
+  bool _isLoadingMore = false;
+  bool _hasMore = true;
+
+  Future<void> _loadSchemesFromDb({
+    String? state,
+    String? q,
+    String? category,
+    String? level,
+  }) async {
+    final int requestId = ++_activeSearchRequestId;
+    setState(() {
+      _isLoading = true;
+      _hasMore = true;
+    });
     try {
       final String? stateParam =
           (state != null && state != 'All States') ? state : null;
-      // Fast responsive batch size (200 schemes for All, up to 500 when state selected)
-      final int batchLimit = stateParam != null ? 500 : 200;
+      final String? catParam =
+          (category != null && category != 'All') ? category : null;
+      final String? lvlParam =
+          (level != null && level != 'All' && !level.contains('Eligible')) ? level : null;
+
+      // 100 schemes per batch for instant rendering and minimal memory footprint
       final results = await SchemeService.instance.fetchSchemes(
         state: stateParam,
         q: q,
-        limit: batchLimit,
+        category: catParam,
+        level: lvlParam,
+        limit: 100,
+        skip: 0,
       );
       final count = await SchemeService.instance.fetchSchemeCount(
         state: stateParam,
         q: q,
+        category: catParam,
+        level: lvlParam,
       );
-      if (mounted) {
+      if (mounted && requestId == _activeSearchRequestId) {
         setState(() {
           _allSchemes = results;
           _totalCount = count ?? results.length;
+          _hasMore = results.length >= 100;
           _isLoading = false;
         });
       }
     } catch (_) {
-      if (mounted) {
+      if (mounted && requestId == _activeSearchRequestId) {
         setState(() => _isLoading = false);
       }
+    }
+  }
+
+  Future<void> _loadMoreSchemes() async {
+    if (_isLoading || _isLoadingMore || !_hasMore || widget.dynamicSchemes != null) return;
+    setState(() => _isLoadingMore = true);
+    try {
+      final String? stateParam =
+          (_selectedState != 'All States') ? _selectedState : null;
+      final String? catParam =
+          (_selectedCategory != 'All') ? _selectedCategory : null;
+      final String? lvlParam =
+          (_selectedFilterIndex != 0 && !_filters[_selectedFilterIndex].contains('Eligible'))
+              ? _filters[_selectedFilterIndex]
+              : null;
+      final String? qParam =
+          _searchController.text.trim().isNotEmpty ? _searchController.text.trim() : null;
+
+      final moreResults = await SchemeService.instance.fetchSchemes(
+        state: stateParam,
+        q: qParam,
+        category: catParam,
+        level: lvlParam,
+        limit: 100,
+        skip: _allSchemes.length,
+      );
+      if (mounted) {
+        setState(() {
+          if (moreResults.isEmpty) {
+            _hasMore = false;
+          } else {
+            _allSchemes.addAll(moreResults);
+            _hasMore = moreResults.length >= 100;
+          }
+          _isLoadingMore = false;
+        });
+      }
+    } catch (_) {
+      if (mounted) setState(() => _isLoadingMore = false);
     }
   }
 
@@ -990,16 +1056,22 @@ class _SchemesContentViewState extends State<SchemesContentView> {
                             ),
                             onPressed: () {
                               final stateChanged = tempState != _selectedState;
+                              final catChanged = tempCategory != _selectedCategory;
+                              final filterChanged = tempFilterIdx != _selectedFilterIndex;
                               setState(() {
                                 _selectedState = tempState;
                                 _selectedFilterIndex = tempFilterIdx;
                                 _selectedCategory = tempCategory;
                               });
                               Navigator.pop(ctx);
-                              if (stateChanged) {
+                              if (stateChanged || catChanged || filterChanged) {
                                 _loadSchemesFromDb(
                                   state: tempState != 'All States' ? tempState : null,
                                   q: _searchController.text.trim().isNotEmpty ? _searchController.text.trim() : null,
+                                  category: tempCategory != 'All' ? tempCategory : null,
+                                  level: (tempFilterIdx != 0 && !_filters[tempFilterIdx].contains('Eligible'))
+                                      ? _filters[tempFilterIdx]
+                                      : null,
                                 );
                               }
                             },
@@ -1388,7 +1460,15 @@ class _SchemesContentViewState extends State<SchemesContentView> {
                           ),
                           const SizedBox(width: 4),
                           GestureDetector(
-                            onTap: () => setState(() => _selectedFilterIndex = 0),
+                            onTap: () {
+                              setState(() => _selectedFilterIndex = 0);
+                              _loadSchemesFromDb(
+                                state: _selectedState != 'All States' ? _selectedState : null,
+                                q: _searchController.text.trim().isNotEmpty ? _searchController.text.trim() : null,
+                                category: _selectedCategory != 'All' ? _selectedCategory : null,
+                                level: null,
+                              );
+                            },
                             child: const Icon(Icons.close_rounded, size: 14, color: Color(0xFF3525CD)),
                           ),
                         ],
@@ -1425,6 +1505,10 @@ class _SchemesContentViewState extends State<SchemesContentView> {
                               _loadSchemesFromDb(
                                 state: null,
                                 q: _searchController.text.trim().isNotEmpty ? _searchController.text.trim() : null,
+                                category: _selectedCategory != 'All' ? _selectedCategory : null,
+                                level: (_selectedFilterIndex != 0 && !_filters[_selectedFilterIndex].contains('Eligible'))
+                                    ? _filters[_selectedFilterIndex]
+                                    : null,
                               );
                             },
                             child: const Icon(Icons.close_rounded, size: 14, color: Color(0xFF3525CD)),
@@ -1458,7 +1542,17 @@ class _SchemesContentViewState extends State<SchemesContentView> {
                           ),
                           const SizedBox(width: 4),
                           GestureDetector(
-                            onTap: () => setState(() => _selectedCategory = 'All'),
+                            onTap: () {
+                              setState(() => _selectedCategory = 'All');
+                              _loadSchemesFromDb(
+                                state: _selectedState != 'All States' ? _selectedState : null,
+                                q: _searchController.text.trim().isNotEmpty ? _searchController.text.trim() : null,
+                                category: null,
+                                level: (_selectedFilterIndex != 0 && !_filters[_selectedFilterIndex].contains('Eligible'))
+                                    ? _filters[_selectedFilterIndex]
+                                    : null,
+                              );
+                            },
                             child: const Icon(Icons.close_rounded, size: 14, color: Color(0xFF0F1D36)),
                           ),
                         ],
@@ -1590,6 +1684,42 @@ class _SchemesContentViewState extends State<SchemesContentView> {
                 return _buildSchemeCard(scheme);
               },
             ),
+          if (_hasMore && schemes.isNotEmpty) ...[
+            const SizedBox(height: 14),
+            Center(
+              child: _isLoadingMore
+                  ? const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 12),
+                      child: SizedBox(
+                        width: 24,
+                        height: 24,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2.5,
+                          valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF3525CD)),
+                        ),
+                      ),
+                    )
+                  : OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: const Color(0xFF3525CD),
+                        side: const BorderSide(color: Color(0xFFD6E3FF)),
+                        backgroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      ),
+                      onPressed: _loadMoreSchemes,
+                      icon: const Icon(Icons.arrow_downward_rounded, size: 16),
+                      label: Text(
+                        'Load More Schemes (${_allSchemes.length}${_totalCount != null ? ' of $_totalCount' : ''})',
+                        style: const TextStyle(
+                          fontFamily: 'Plus Jakarta Sans',
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+            ),
+          ],
           const SizedBox(height: 18),
 
           // ── Ask Sathi AI Card ──

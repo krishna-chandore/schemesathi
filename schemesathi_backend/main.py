@@ -300,19 +300,43 @@ def get_user_profile(
 def get_schemes(
     state: str = Query(None, description="Filter by state name (case-insensitive)"),
     q: Optional[str] = Query(None, max_length=100, description="Search keyword across title, name, and tags"),
+    category: Optional[str] = Query(None, max_length=100, description="Filter by sector / category"),
+    level: Optional[str] = Query(None, max_length=50, description="Filter by level: Central or State"),
     limit: int = Query(500, ge=1, le=10000),
     skip: int = Query(0, ge=0),
 ):
     """
     Return schemes from the 'schemes' collection.
     Includes scheme_key, active/application state, and source url.
-    Supports secure regex search across name, data.title, and data.tags.
+    Supports secure regex search across name, data.title, and data.tags,
+    as well as state, category, and level filtering.
     """
     try:
         query: Dict[str, Any] = {}
         if state and state.strip().lower() != "all states" and state.strip().lower() != "all":
             escaped_state = re.escape(state.strip())
             query["state"] = re.compile(f"^{escaped_state}$", re.IGNORECASE)
+
+        if category and category.strip().lower() != "all":
+            escaped_cat = re.escape(category.strip().replace(" ", ""))
+            # Match loosely ignoring spacing discrepancies
+            query["$or"] = [
+                {"data.categories": re.compile(re.escape(category.strip()), re.IGNORECASE)},
+                {"data.tags": re.compile(re.escape(category.strip()), re.IGNORECASE)},
+            ]
+
+        if level and level.strip().lower() != "all" and "eligible" not in level.strip().lower():
+            lvl = level.strip()
+            if lvl.lower() == "central":
+                query["$or"] = [
+                    {"data.level": re.compile(r"^central$", re.IGNORECASE)},
+                    {"state": re.compile(r"^central$", re.IGNORECASE)},
+                ]
+            elif lvl.lower() == "state":
+                query["$or"] = [
+                    {"data.level": re.compile(r"^state", re.IGNORECASE)},
+                    {"state": {"$nin": ["Central", "central"]}},
+                ]
 
         if q and q.strip():
             # Security: cap length to 100 chars, escape regex chars to prevent ReDoS / injection
@@ -330,7 +354,10 @@ def get_schemes(
                     }
                     for r in token_regexes
                 ]
-                query["$and"] = token_clauses
+                if "$and" in query:
+                    query["$and"].extend(token_clauses)
+                else:
+                    query["$and"] = token_clauses
 
         cursor = (
             schemes_collection.find(
@@ -470,13 +497,34 @@ def list_states():
 def count_schemes(
     state: str = Query(None),
     q: Optional[str] = Query(None, max_length=100),
+    category: Optional[str] = Query(None, max_length=100),
+    level: Optional[str] = Query(None, max_length=50),
 ):
-    """Return the total number of schemes, optionally filtered by state and search query."""
+    """Return the total number of schemes, optionally filtered by state, query, category, and level."""
     try:
         query: Dict[str, Any] = {}
         if state and state.strip().lower() != "all states" and state.strip().lower() != "all":
             escaped_state = re.escape(state.strip())
             query["state"] = re.compile(f"^{escaped_state}$", re.IGNORECASE)
+
+        if category and category.strip().lower() != "all":
+            query["$or"] = [
+                {"data.categories": re.compile(re.escape(category.strip()), re.IGNORECASE)},
+                {"data.tags": re.compile(re.escape(category.strip()), re.IGNORECASE)},
+            ]
+
+        if level and level.strip().lower() != "all" and "eligible" not in level.strip().lower():
+            lvl = level.strip()
+            if lvl.lower() == "central":
+                query["$or"] = [
+                    {"data.level": re.compile(r"^central$", re.IGNORECASE)},
+                    {"state": re.compile(r"^central$", re.IGNORECASE)},
+                ]
+            elif lvl.lower() == "state":
+                query["$or"] = [
+                    {"data.level": re.compile(r"^state", re.IGNORECASE)},
+                    {"state": {"$nin": ["Central", "central"]}},
+                ]
 
         if q and q.strip():
             clean_q = q.strip()[:100]
@@ -493,7 +541,10 @@ def count_schemes(
                     }
                     for r in token_regexes
                 ]
-                query["$and"] = token_clauses
+                if "$and" in query:
+                    query["$and"].extend(token_clauses)
+                else:
+                    query["$and"] = token_clauses
 
         return {"count": schemes_collection.count_documents(query)}
     except PyMongoError as e:

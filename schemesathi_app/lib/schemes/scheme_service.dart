@@ -36,6 +36,8 @@ class SchemeService {
   Future<List<SchemeItem>> fetchSchemes({
     String? state,
     String? q,
+    String? category,
+    String? level,
     int limit = 200,
     int skip = 0,
   }) async {
@@ -49,6 +51,12 @@ class SchemeService {
       }
       if (q != null && q.trim().isNotEmpty) {
         queryParams['q'] = q.trim();
+      }
+      if (category != null && category.trim().isNotEmpty && category.trim().toLowerCase() != 'all') {
+        queryParams['category'] = category.trim();
+      }
+      if (level != null && level.trim().isNotEmpty && level.trim().toLowerCase() != 'all' && level.trim().toLowerCase() != '✨ eligible for me') {
+        queryParams['level'] = level.trim();
       }
 
       final uri = Uri.parse('$baseUrl/schemes').replace(queryParameters: queryParams);
@@ -242,7 +250,12 @@ class SchemeService {
   }
 
   /// Fetches the count of schemes in the database.
-  Future<int?> fetchSchemeCount({String? state, String? q}) async {
+  Future<int?> fetchSchemeCount({
+    String? state,
+    String? q,
+    String? category,
+    String? level,
+  }) async {
     try {
       final queryParams = <String, String>{};
       if (state != null && state.trim().isNotEmpty && state.trim().toLowerCase() != 'all' && state.trim().toLowerCase() != 'all states') {
@@ -250,6 +263,12 @@ class SchemeService {
       }
       if (q != null && q.trim().isNotEmpty) {
         queryParams['q'] = q.trim();
+      }
+      if (category != null && category.trim().isNotEmpty && category.trim().toLowerCase() != 'all') {
+        queryParams['category'] = category.trim();
+      }
+      if (level != null && level.trim().isNotEmpty && level.trim().toLowerCase() != 'all' && level.trim().toLowerCase() != '✨ eligible for me') {
+        queryParams['level'] = level.trim();
       }
       final uri = Uri.parse('$baseUrl/schemes/count').replace(queryParameters: queryParams);
       final response = await http.get(uri).timeout(const Duration(seconds: 5));
