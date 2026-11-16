@@ -334,11 +334,21 @@ class _SchemesContentViewState extends State<SchemesContentView> {
 
       // 3. Search query filter
       if (query.isNotEmpty) {
-        final inTitle = scheme.title.toLowerCase().contains(query);
-        final inDesc = scheme.description.toLowerCase().contains(query);
-        final inCat = scheme.category.toLowerCase().contains(query);
-        final inTags = scheme.tags.any((t) => t.toLowerCase().contains(query));
-        if (!inTitle && !inDesc && !inCat && !inTags) return false;
+        final tokens = query.split(RegExp(r'[\s\-_/()]+')).where((t) => t.isNotEmpty).toList();
+        if (tokens.isNotEmpty) {
+          final titleLower = scheme.title.toLowerCase();
+          final descLower = scheme.description.toLowerCase();
+          final catLower = scheme.category.toLowerCase();
+          final tagsLower = scheme.tags.map((t) => t.toLowerCase()).toList();
+
+          final allTokensMatch = tokens.every((token) {
+            return titleLower.contains(token) ||
+                descLower.contains(token) ||
+                catLower.contains(token) ||
+                tagsLower.any((t) => t.contains(token));
+          });
+          if (!allTokensMatch) return false;
+        }
       }
 
       return true;

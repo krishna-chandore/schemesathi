@@ -312,52 +312,67 @@ def get_schemes(
     as well as state, category, and level filtering.
     """
     try:
-        query: Dict[str, Any] = {}
+        query_clauses = []
+
+        # 1. State filter: if a citizen selects their state, include their state's schemes
+        # PLUS nationwide Central schemes so central benefits are never hidden!
         if state and state.strip().lower() != "all states" and state.strip().lower() != "all":
             escaped_state = re.escape(state.strip())
-            query["state"] = re.compile(f"^{escaped_state}$", re.IGNORECASE)
+            central_regex = re.compile(r"^(all\s*india|national|central)$", re.IGNORECASE)
+            query_clauses.append({
+                "$or": [
+                    {"state": re.compile(f"^{escaped_state}$", re.IGNORECASE)},
+                    {"state": central_regex},
+                    {"data.level": re.compile(r"^central", re.IGNORECASE)},
+                ]
+            })
 
+        # 2. Category filter
         if category and category.strip().lower() != "all":
-            escaped_cat = re.escape(category.strip().replace(" ", ""))
-            # Match loosely ignoring spacing discrepancies
-            query["$or"] = [
-                {"data.categories": re.compile(re.escape(category.strip()), re.IGNORECASE)},
-                {"data.tags": re.compile(re.escape(category.strip()), re.IGNORECASE)},
-            ]
+            escaped_cat = re.escape(category.strip())
+            cat_regex = re.compile(escaped_cat, re.IGNORECASE)
+            query_clauses.append({
+                "$or": [
+                    {"data.categories": cat_regex},
+                    {"data.tags": cat_regex},
+                ]
+            })
 
+        # 3. Level filter
         if level and level.strip().lower() != "all" and "eligible" not in level.strip().lower():
-            lvl = level.strip()
-            if lvl.lower() == "central":
-                query["$or"] = [
-                    {"data.level": re.compile(r"^central$", re.IGNORECASE)},
-                    {"state": re.compile(r"^central$", re.IGNORECASE)},
-                ]
-            elif lvl.lower() == "state":
-                query["$or"] = [
-                    {"data.level": re.compile(r"^state", re.IGNORECASE)},
-                    {"state": {"$nin": ["Central", "central"]}},
-                ]
+            lvl = level.strip().lower()
+            if lvl == "central":
+                query_clauses.append({
+                    "$or": [
+                        {"data.level": re.compile(r"^central$", re.IGNORECASE)},
+                        {"state": re.compile(r"^central$", re.IGNORECASE)},
+                    ]
+                })
+            elif lvl == "state":
+                query_clauses.append({
+                    "$or": [
+                        {"data.level": re.compile(r"^state", re.IGNORECASE)},
+                        {"state": {"$nin": ["Central", "central", "All India", "National"]}},
+                    ]
+                })
 
+        # 4. Search query tokens: split on whitespace, hyphen, underscore, slash, parenthesis
         if q and q.strip():
-            # Security: cap length to 100 chars, escape regex chars to prevent ReDoS / injection
             clean_q = q.strip()[:100]
-            tokens = [re.escape(t) for t in clean_q.split() if t][:5]
-            if tokens:
-                token_regexes = [re.compile(t, re.IGNORECASE) for t in tokens]
-                token_clauses = [
-                    {
-                        "$or": [
-                            {"name": r},
-                            {"data.title": r},
-                            {"data.tags": r},
-                        ]
-                    }
-                    for r in token_regexes
-                ]
-                if "$and" in query:
-                    query["$and"].extend(token_clauses)
-                else:
-                    query["$and"] = token_clauses
+            tokens = [re.escape(t) for t in re.split(r"[\s\-_/()]+", clean_q) if t][:5]
+            for t in tokens:
+                r = re.compile(t, re.IGNORECASE)
+                query_clauses.append({
+                    "$or": [
+                        {"name": r},
+                        {"data.title": r},
+                        {"data.tags": r},
+                        {"data.description": r},
+                        {"data.ministry": r},
+                    ]
+                })
+
+        query: Dict[str, Any] = {"$and": query_clauses} if query_clauses else {}
 
         cursor = (
             schemes_collection.find(
@@ -502,50 +517,62 @@ def count_schemes(
 ):
     """Return the total number of schemes, optionally filtered by state, query, category, and level."""
     try:
-        query: Dict[str, Any] = {}
+        query_clauses = []
+
         if state and state.strip().lower() != "all states" and state.strip().lower() != "all":
             escaped_state = re.escape(state.strip())
-            query["state"] = re.compile(f"^{escaped_state}$", re.IGNORECASE)
+            central_regex = re.compile(r"^(all\s*india|national|central)$", re.IGNORECASE)
+            query_clauses.append({
+                "$or": [
+                    {"state": re.compile(f"^{escaped_state}$", re.IGNORECASE)},
+                    {"state": central_regex},
+                    {"data.level": re.compile(r"^central", re.IGNORECASE)},
+                ]
+            })
 
         if category and category.strip().lower() != "all":
-            query["$or"] = [
-                {"data.categories": re.compile(re.escape(category.strip()), re.IGNORECASE)},
-                {"data.tags": re.compile(re.escape(category.strip()), re.IGNORECASE)},
-            ]
+            escaped_cat = re.escape(category.strip())
+            cat_regex = re.compile(escaped_cat, re.IGNORECASE)
+            query_clauses.append({
+                "$or": [
+                    {"data.categories": cat_regex},
+                    {"data.tags": cat_regex},
+                ]
+            })
 
         if level and level.strip().lower() != "all" and "eligible" not in level.strip().lower():
-            lvl = level.strip()
-            if lvl.lower() == "central":
-                query["$or"] = [
-                    {"data.level": re.compile(r"^central$", re.IGNORECASE)},
-                    {"state": re.compile(r"^central$", re.IGNORECASE)},
-                ]
-            elif lvl.lower() == "state":
-                query["$or"] = [
-                    {"data.level": re.compile(r"^state", re.IGNORECASE)},
-                    {"state": {"$nin": ["Central", "central"]}},
-                ]
+            lvl = level.strip().lower()
+            if lvl == "central":
+                query_clauses.append({
+                    "$or": [
+                        {"data.level": re.compile(r"^central$", re.IGNORECASE)},
+                        {"state": re.compile(r"^central$", re.IGNORECASE)},
+                    ]
+                })
+            elif lvl == "state":
+                query_clauses.append({
+                    "$or": [
+                        {"data.level": re.compile(r"^state", re.IGNORECASE)},
+                        {"state": {"$nin": ["Central", "central", "All India", "National"]}},
+                    ]
+                })
 
         if q and q.strip():
             clean_q = q.strip()[:100]
-            tokens = [re.escape(t) for t in clean_q.split() if t][:5]
-            if tokens:
-                token_regexes = [re.compile(t, re.IGNORECASE) for t in tokens]
-                token_clauses = [
-                    {
-                        "$or": [
-                            {"name": r},
-                            {"data.title": r},
-                            {"data.tags": r},
-                        ]
-                    }
-                    for r in token_regexes
-                ]
-                if "$and" in query:
-                    query["$and"].extend(token_clauses)
-                else:
-                    query["$and"] = token_clauses
+            tokens = [re.escape(t) for t in re.split(r"[\s\-_/()]+", clean_q) if t][:5]
+            for t in tokens:
+                r = re.compile(t, re.IGNORECASE)
+                query_clauses.append({
+                    "$or": [
+                        {"name": r},
+                        {"data.title": r},
+                        {"data.tags": r},
+                        {"data.description": r},
+                        {"data.ministry": r},
+                    ]
+                })
 
+        query: Dict[str, Any] = {"$and": query_clauses} if query_clauses else {}
         return {"count": schemes_collection.count_documents(query)}
     except PyMongoError as e:
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
