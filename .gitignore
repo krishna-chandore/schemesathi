@@ -86,6 +86,7 @@ env/
 
 # Scraper runtime caches & dumps
 .myscheme_dataset_cache.json
+.myscheme_detail_cache.json
 *.json.bak
 scraped_schemes.json
 scraped_*.json

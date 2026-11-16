@@ -35,6 +35,7 @@ class SchemeService {
   /// Falls back to default schemes if the backend is unreachable.
   Future<List<SchemeItem>> fetchSchemes({
     String? state,
+    String? q,
     int limit = 200,
     int skip = 0,
   }) async {
@@ -43,8 +44,11 @@ class SchemeService {
         'limit': limit.toString(),
         'skip': skip.toString(),
       };
-      if (state != null && state.trim().isNotEmpty && state.trim().toLowerCase() != 'all') {
+      if (state != null && state.trim().isNotEmpty && state.trim().toLowerCase() != 'all' && state.trim().toLowerCase() != 'all states') {
         queryParams['state'] = state.trim();
+      }
+      if (q != null && q.trim().isNotEmpty) {
+        queryParams['q'] = q.trim();
       }
 
       final uri = Uri.parse('$baseUrl/schemes').replace(queryParameters: queryParams);
@@ -238,11 +242,14 @@ class SchemeService {
   }
 
   /// Fetches the count of schemes in the database.
-  Future<int?> fetchSchemeCount({String? state}) async {
+  Future<int?> fetchSchemeCount({String? state, String? q}) async {
     try {
       final queryParams = <String, String>{};
-      if (state != null && state.trim().isNotEmpty && state.trim().toLowerCase() != 'all') {
+      if (state != null && state.trim().isNotEmpty && state.trim().toLowerCase() != 'all' && state.trim().toLowerCase() != 'all states') {
         queryParams['state'] = state.trim();
+      }
+      if (q != null && q.trim().isNotEmpty) {
+        queryParams['q'] = q.trim();
       }
       final uri = Uri.parse('$baseUrl/schemes/count').replace(queryParameters: queryParams);
       final response = await http.get(uri).timeout(const Duration(seconds: 5));

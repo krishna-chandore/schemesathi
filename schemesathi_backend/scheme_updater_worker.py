@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import asyncio
@@ -11,6 +10,7 @@ import os
 import re
 import sys
 import time
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
@@ -103,6 +103,8 @@ DEFAULT_STATES_AND_UTS: Tuple[str, ...] = (
     "Andaman and Nicobar Islands", "Chandigarh",
     "Dadra and Nagar Haveli and Daman and Diu", "Delhi", "Jammu and Kashmir",
     "Ladakh", "Lakshadweep", "Puducherry",
+    # Central (all-India) schemes
+    "Central",
 )
 
 # Scraper function names tried (in order) when SCRAPER_FUNCTION is not set.
@@ -162,11 +164,11 @@ class UpdaterConfig:
     scraper_function: str = ""
     states: Optional[Tuple[str, ...]] = None
     scrape_retries: int = 2
-    retry_backoff: float = 5.0
-    state_delay: float = 1.0
-    batch_size: int = 4
-    batch_delay: float = 30.0
-    rate_limit_backoff: float = 60.0
+    retry_backoff: float = 10.0
+    state_delay: float = 0.5
+    batch_size: int = 6
+    batch_delay: float = 5.0
+    rate_limit_backoff: float = 5.0
 
     @classmethod
     def from_env(cls) -> "UpdaterConfig":
@@ -185,11 +187,11 @@ class UpdaterConfig:
             scraper_function=env_str("SCRAPER_FUNCTION", ""),
             states=states,
             scrape_retries=env_int("SCRAPE_RETRIES", 2, minimum=0),
-            retry_backoff=env_float("SCRAPE_RETRY_BACKOFF", 5.0, minimum=0.0),
-            state_delay=env_float("STATE_DELAY_SECONDS", 1.0, minimum=0.0),
-            batch_size=env_int('BATCH_SIZE', 4, minimum=1),
-            batch_delay=env_float('BATCH_DELAY_SECONDS', 30.0, minimum=0.0),
-            rate_limit_backoff=env_float('RATE_LIMIT_BACKOFF_SECONDS', 60.0, minimum=5.0),
+            retry_backoff=env_float("SCRAPE_RETRY_BACKOFF", 10.0, minimum=0.0),
+            state_delay=env_float("STATE_DELAY_SECONDS", 0.5, minimum=0.0),
+            batch_size=env_int('BATCH_SIZE', 6, minimum=1),
+            batch_delay=env_float('BATCH_DELAY_SECONDS', 5.0, minimum=0.0),
+            rate_limit_backoff=env_float('RATE_LIMIT_BACKOFF_SECONDS', 5.0, minimum=1.0),
         )
 
 
@@ -281,7 +283,7 @@ def load_scraper(module_name: str, function_name: str) -> Tuple[Any, Callable[..
                 method = getattr(instance, method_name, None)
                 if callable(method):
                     logger.info("Using scraper class %s.%s", class_name, method_name)
-                    return module, lambda state, _method=method: _method(state)
+                    return module, lambda state, known=None, _method=method: _method(state, known=known)
 
     public = sorted(
         n for n, v in vars(module).items()
@@ -312,6 +314,14 @@ def _as_state_list(value: Any) -> Optional[List[str]]:
 
 
 def discover_states(module: Any) -> List[str]:
+    """Discover states/UTs; Central (all-India) schemes are always included."""
+    found = _discover_states(module)
+    if not any(s.casefold() == "central" for s in found):
+        found.append("Central")
+    return found
+
+
+def _discover_states(module: Any) -> List[str]:
     """Prefer the scraper's own list of supported states/UTs, else use the defaults."""
     for attr in CANDIDATE_STATE_ATTRS:
         found = _as_state_list(getattr(module, attr, None))
@@ -526,9 +536,11 @@ class SchemeUpdater:
         try:
             return redis.Redis.from_url(
                 self.cfg.redis_url,
-                decode_responses=True,
-                socket_timeout=5,
-                socket_connect_timeout=5,
+                decode_responses=False,  # values may be compressed bytes
+                socket_timeout=30,
+                socket_connect_timeout=10,
+                retry_on_timeout=True,
+                health_check_interval=30,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not create Redis client (%s); cache refresh will be skipped", exc)
@@ -539,8 +551,25 @@ class SchemeUpdater:
         self.collection.create_index([("state", ASCENDING), ("name", ASCENDING)], name="state_name")
 
     # -- scraping (delegated to the existing scraper) ------------------------ #
+    def _load_known(self, state: str) -> Dict[str, Dict[str, Any]]:
+        """slug -> stored data for schemes already in MongoDB (used to skip unchanged schemes)."""
+        known: Dict[str, Dict[str, Any]] = {}
+        try:
+            for row in self.collection.find({"state": state}, {"data": 1}):
+                d = row.get("data") or {}
+                slug = d.get("slug") or str(d.get("url", "")).rstrip("/").split("/")[-1]
+                if slug:
+                    known[slug] = d
+        except PyMongoError as exc:
+            logger.warning("[%s] could not load existing schemes (will fetch all): %s", state, exc)
+        return known
+
     def _scrape_once(self, state: str) -> List[Dict[str, Any]]:
-        result = self._scrape(state)
+        try:
+            takes_known = "known" in inspect.signature(self._scrape).parameters
+        except (TypeError, ValueError):
+            takes_known = False
+        result = self._scrape(state, known=self._load_known(state)) if takes_known else self._scrape(state)
         if inspect.isawaitable(result):
             result = _run_awaitable(result)
         records = extract_records(result)
@@ -684,9 +713,14 @@ class SchemeUpdater:
 
         for chunk in _chunks(unchanged_keys, LOOKUP_CHUNK):
             try:
-                self.collection.update_many(
-                    {"scheme_key": {"$in": chunk}}, {"$set": {"last_seen_at": now, "is_active": True}}
-                )
+                # also refresh data.scraped_at (ignored by the content hash) so the re-check age resets
+                self.collection.bulk_write([
+                    UpdateOne(
+                        {"scheme_key": k},
+                        {"$set": {"last_seen_at": now, "is_active": True,
+                                  "data.scraped_at": docs[k].data.get("scraped_at")}},
+                    ) for k in chunk
+                ], ordered=False)
             except PyMongoError as exc:
                 logger.warning("[%s] could not update last_seen_at: %s", state, exc)
                 break
@@ -719,23 +753,59 @@ class SchemeUpdater:
             logger.warning("Could not inspect Redis cache (%s); refreshing changed states only", exc)
         return states, refresh_all or bool(states)
 
+    def _redis_set(self, key: str, value: Any, ttl: Optional[int], attempts: int = 4) -> bool:
+        """Single SET with retry/backoff; oversized values are skipped, never raised."""
+        max_bytes = env_int("REDIS_MAX_VALUE_BYTES", 64 * 1024 * 1024, minimum=1024)
+        size = len(value) if isinstance(value, (bytes, bytearray)) else len(value.encode("utf-8"))
+        if size > max_bytes:
+            logger.error("Skipping Redis key %s: %.1f MB exceeds REDIS_MAX_VALUE_BYTES", key, size / 1e6)
+            return False
+        for attempt in range(1, attempts + 1):
+            try:
+                self._redis.set(key, value, ex=ttl)
+                return True
+            except Exception as exc:  # noqa: BLE001
+                if "maxmemory" in str(exc).lower() or "OOM" in str(exc):
+                    logger.error("Redis is full (maxmemory); not retrying %s. Free memory, upgrade, "
+                                 "or set REDIS_CACHE_ALL=false.", key)
+                    return False
+                logger.warning("Redis SET %s failed (%d/%d): %s", key, attempt, attempts, exc)
+                time.sleep(min(2 ** attempt, 15))
+        return False
+
+    @staticmethod
+    def _encode(payload: str, label: str) -> Any:
+        """zlib-compress the JSON (REDIS_COMPRESS, default on). Readers: zlib.decompress(raw) -> JSON."""
+        if not env_bool("REDIS_COMPRESS", True):
+            return payload
+        raw = payload.encode("utf-8")
+        packed = zlib.compress(raw, 6)
+        logger.info("Redis %s: %.1f MB -> %.1f MB compressed (%.1fx)",
+                    label, len(raw) / 1e6, len(packed) / 1e6, len(raw) / max(len(packed), 1))
+        return packed
+
+    @staticmethod
+    def _dump_docs(docs: Iterable[Dict[str, Any]]) -> str:
+        """Same JSON as json.dumps(list) but built piecewise (no 2x memory spike)."""
+        return "[" + ",".join(json.dumps(d, default=_json_default) for d in docs) + "]"
+
     def refresh_cache(self, states: Iterable[str], refresh_all: bool = True) -> bool:
-        """Rebuild cache entries from MongoDB (the source of truth). Never raises."""
+        """Rebuild cache entries from MongoDB (source of truth). One key per SET, retried. Never raises."""
         if self._redis is None:
             return False
+        ttl = self.cfg.cache_ttl if self.cfg.cache_ttl > 0 else None
+        ok = True
         try:
-            ttl = self.cfg.cache_ttl if self.cfg.cache_ttl > 0 else None
-            pipe = self._redis.pipeline(transaction=False)
             for state in sorted(set(states)):
-                docs = list(self.collection.find({"state": state}, {"_id": 0}).sort("name", ASCENDING))
-                if docs:
-                    pipe.set(self._state_key(state), json.dumps(docs, default=_json_default), ex=ttl)
-            if refresh_all:
-                all_docs = list(self.collection.find({}, {"_id": 0}).sort([("state", ASCENDING), ("name", ASCENDING)]))
-                pipe.set(self._all_key(), json.dumps(all_docs, default=_json_default), ex=ttl)
-            pipe.set(self._meta_key(), datetime.now(timezone.utc).isoformat(), ex=ttl)
-            pipe.execute()
-            return True
+                docs = self.collection.find({"state": state}, {"_id": 0}).sort("name", ASCENDING)
+                payload = self._dump_docs(docs)
+                if payload != "[]":
+                    ok &= self._redis_set(self._state_key(state), self._encode(payload, state), ttl)
+            if refresh_all and env_bool("REDIS_CACHE_ALL", False):
+                all_docs = self.collection.find({}, {"_id": 0}).sort([("state", ASCENDING), ("name", ASCENDING)])
+                ok &= self._redis_set(self._all_key(), self._encode(self._dump_docs(all_docs), "all"), ttl)
+            ok &= self._redis_set(self._meta_key(), datetime.now(timezone.utc).isoformat(), ttl)
+            return ok
         except Exception as exc:  # noqa: BLE001 - cache problems must not fail the sync
             logger.error("Redis cache refresh failed (MongoDB data is intact): %s", exc)
             return False

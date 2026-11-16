@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 
 import 'scheme_model.dart';
@@ -147,11 +148,35 @@ class _SchemesContentViewState extends State<SchemesContentView> {
       _searchController.text = widget.initialSearchQuery!.trim();
     }
 
-    _searchController.addListener(() => setState(() {}));
+    _searchController.addListener(_onSearchChanged);
     if (widget.dynamicSchemes == null) {
       _loadStates();
-      _loadSchemesFromDb(state: _selectedState != 'All States' ? _selectedState : null);
+      _loadSchemesFromDb(
+        state: _selectedState != 'All States' ? _selectedState : null,
+        q: _searchController.text.trim().isNotEmpty ? _searchController.text.trim() : null,
+      );
     }
+  }
+
+  Timer? _searchDebounceTimer;
+  String _lastSearchedQuery = '';
+
+  void _onSearchChanged() {
+    setState(() {});
+    if (widget.dynamicSchemes != null) return;
+
+    final currentQuery = _searchController.text.trim();
+    if (currentQuery == _lastSearchedQuery) return;
+
+    _searchDebounceTimer?.cancel();
+    _searchDebounceTimer = Timer(const Duration(milliseconds: 350), () {
+      if (!mounted) return;
+      _lastSearchedQuery = currentQuery;
+      _loadSchemesFromDb(
+        state: _selectedState != 'All States' ? _selectedState : null,
+        q: currentQuery.isNotEmpty ? currentQuery : null,
+      );
+    });
   }
 
   Future<void> _loadStates() async {
@@ -170,7 +195,7 @@ class _SchemesContentViewState extends State<SchemesContentView> {
     } catch (_) {}
   }
 
-  Future<void> _loadSchemesFromDb({String? state}) async {
+  Future<void> _loadSchemesFromDb({String? state, String? q}) async {
     setState(() => _isLoading = true);
     try {
       final String? stateParam =
@@ -179,10 +204,12 @@ class _SchemesContentViewState extends State<SchemesContentView> {
       final int batchLimit = stateParam != null ? 500 : 200;
       final results = await SchemeService.instance.fetchSchemes(
         state: stateParam,
+        q: q,
         limit: batchLimit,
       );
       final count = await SchemeService.instance.fetchSchemeCount(
         state: stateParam,
+        q: q,
       );
       if (mounted) {
         setState(() {
@@ -210,6 +237,7 @@ class _SchemesContentViewState extends State<SchemesContentView> {
 
   @override
   void dispose() {
+    _searchDebounceTimer?.cancel();
     _searchController.dispose();
     super.dispose();
   }
@@ -971,6 +999,7 @@ class _SchemesContentViewState extends State<SchemesContentView> {
                               if (stateChanged) {
                                 _loadSchemesFromDb(
                                   state: tempState != 'All States' ? tempState : null,
+                                  q: _searchController.text.trim().isNotEmpty ? _searchController.text.trim() : null,
                                 );
                               }
                             },
@@ -1393,7 +1422,10 @@ class _SchemesContentViewState extends State<SchemesContentView> {
                           GestureDetector(
                             onTap: () {
                               setState(() => _selectedState = 'All States');
-                              _loadSchemesFromDb();
+                              _loadSchemesFromDb(
+                                state: null,
+                                q: _searchController.text.trim().isNotEmpty ? _searchController.text.trim() : null,
+                              );
                             },
                             child: const Icon(Icons.close_rounded, size: 14, color: Color(0xFF3525CD)),
                           ),

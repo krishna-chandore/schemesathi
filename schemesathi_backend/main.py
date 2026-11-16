@@ -299,18 +299,38 @@ def get_user_profile(
 @app.get("/schemes")
 def get_schemes(
     state: str = Query(None, description="Filter by state name (case-insensitive)"),
+    q: Optional[str] = Query(None, max_length=100, description="Search keyword across title, name, and tags"),
     limit: int = Query(500, ge=1, le=10000),
     skip: int = Query(0, ge=0),
 ):
     """
     Return schemes from the 'schemes' collection.
     Includes scheme_key, active/application state, and source url.
+    Supports secure regex search across name, data.title, and data.tags.
     """
     try:
-        query = {}
-        if state:
+        query: Dict[str, Any] = {}
+        if state and state.strip().lower() != "all states" and state.strip().lower() != "all":
             escaped_state = re.escape(state.strip())
             query["state"] = re.compile(f"^{escaped_state}$", re.IGNORECASE)
+
+        if q and q.strip():
+            # Security: cap length to 100 chars, escape regex chars to prevent ReDoS / injection
+            clean_q = q.strip()[:100]
+            tokens = [re.escape(t) for t in clean_q.split() if t][:5]
+            if tokens:
+                token_regexes = [re.compile(t, re.IGNORECASE) for t in tokens]
+                token_clauses = [
+                    {
+                        "$or": [
+                            {"name": r},
+                            {"data.title": r},
+                            {"data.tags": r},
+                        ]
+                    }
+                    for r in token_regexes
+                ]
+                query["$and"] = token_clauses
 
         cursor = (
             schemes_collection.find(
@@ -447,13 +467,34 @@ def list_states():
 
 
 @app.get("/schemes/count")
-def count_schemes(state: str = Query(None)):
-    """Return the total number of schemes, optionally filtered by state."""
+def count_schemes(
+    state: str = Query(None),
+    q: Optional[str] = Query(None, max_length=100),
+):
+    """Return the total number of schemes, optionally filtered by state and search query."""
     try:
-        query = {}
-        if state:
+        query: Dict[str, Any] = {}
+        if state and state.strip().lower() != "all states" and state.strip().lower() != "all":
             escaped_state = re.escape(state.strip())
             query["state"] = re.compile(f"^{escaped_state}$", re.IGNORECASE)
+
+        if q and q.strip():
+            clean_q = q.strip()[:100]
+            tokens = [re.escape(t) for t in clean_q.split() if t][:5]
+            if tokens:
+                token_regexes = [re.compile(t, re.IGNORECASE) for t in tokens]
+                token_clauses = [
+                    {
+                        "$or": [
+                            {"name": r},
+                            {"data.title": r},
+                            {"data.tags": r},
+                        ]
+                    }
+                    for r in token_regexes
+                ]
+                query["$and"] = token_clauses
+
         return {"count": schemes_collection.count_documents(query)}
     except PyMongoError as e:
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
